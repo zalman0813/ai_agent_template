@@ -1,0 +1,20 @@
+[project]
+name = "ai-agent-chat-backend"
+version = "0.1.0"
+description = "FastAPI backend for AI Agent Chat"
+requires-python = ">=3.11"
+dependencies = [
+    "fastapi>=0.115.0",
+    "uvicorn[standard]>=0.32.0",
+    # Main project dependencies
+    "langchain>=1.0.0",
+    "langchain-anthropic>=0.3.0",
+    "langchain-google-genai>=2.0.0",
+    "langchain-tavily>=0.1.0",
+    "deepagents>=0.2.0",
+    "python-dotenv>=1.0.0",
+    "langchain-openai>=1.1.0",
+]
+
+[tool.uv]
+dev-dependencies = []
