@@ -63,7 +63,7 @@ class AgentObserver:
         Returns:
             Final agent state
         """
-        final_state = None
+        final_state = {}
         current_node = None
 
         for chunk in agent.stream(
@@ -78,18 +78,24 @@ class AgentObserver:
                 if mode == "updates" and isinstance(data, dict):
                     for node_name in data.keys():
                         current_node = node_name
-                        final_state = data[node_name]
+                        node_output = data[node_name]
+                        # Merge state updates
+                        if isinstance(node_output, dict):
+                            final_state = self._merge_state(final_state, node_output)
             else:
                 self._handle_stream_chunk("updates", chunk, current_node)
                 if isinstance(chunk, dict):
                     for node_name in chunk.keys():
                         current_node = node_name
-                        final_state = chunk[node_name]
+                        node_output = chunk[node_name]
+                        # Merge state updates
+                        if isinstance(node_output, dict):
+                            final_state = self._merge_state(final_state, node_output)
 
         for output in self.outputs:
             output.close()
 
-        return final_state or {}
+        return final_state
 
     async def arun(
         self,
@@ -152,7 +158,7 @@ class AgentObserver:
         config: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         """Internal stream processing with empty stream detection."""
-        final_state = None
+        final_state = {}
         current_node = None
         chunk_count = 0
 
@@ -169,13 +175,19 @@ class AgentObserver:
                 if mode == "updates" and isinstance(data, dict):
                     for node_name in data.keys():
                         current_node = node_name
-                        final_state = data[node_name]
+                        node_output = data[node_name]
+                        # Merge state updates
+                        if isinstance(node_output, dict):
+                            final_state = self._merge_state(final_state, node_output)
             else:
                 self._handle_stream_chunk("updates", chunk, current_node)
                 if isinstance(chunk, dict):
                     for node_name in chunk.keys():
                         current_node = node_name
-                        final_state = chunk[node_name]
+                        node_output = chunk[node_name]
+                        # Merge state updates
+                        if isinstance(node_output, dict):
+                            final_state = self._merge_state(final_state, node_output)
 
         # Handle empty stream - trigger retry
         if chunk_count == 0:
@@ -184,7 +196,38 @@ class AgentObserver:
         for output in self.outputs:
             output.close()
 
-        return final_state or {}
+        return final_state
+
+    def _merge_state(self, current: dict, update: dict) -> dict:
+        """Merge state update into current state.
+
+        Special handling for 'messages' list to avoid duplicates.
+
+        Args:
+            current: Current accumulated state
+            update: New state update from a node
+
+        Returns:
+            Merged state dictionary
+        """
+        merged = {**current}
+
+        for key, value in update.items():
+            if key == "messages" and isinstance(value, list):
+                # For messages, extend the list (LangGraph accumulates messages)
+                existing = merged.get("messages", [])
+                if isinstance(existing, list):
+                    # Only add new messages (avoid duplicates from re-streaming)
+                    existing_ids = {id(msg) for msg in existing}
+                    new_messages = [msg for msg in value if id(msg) not in existing_ids]
+                    merged["messages"] = existing + new_messages
+                else:
+                    merged["messages"] = value
+            else:
+                # For other keys, replace with latest value
+                merged[key] = value
+
+        return merged
 
     def _handle_stream_chunk(
         self,

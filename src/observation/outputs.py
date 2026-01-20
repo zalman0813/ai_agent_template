@@ -4,6 +4,7 @@ Supports Console, JSON file, and Callback outputs.
 """
 
 import json
+import uuid
 from abc import ABC, abstractmethod
 from datetime import datetime
 from pathlib import Path
@@ -154,3 +155,48 @@ class CallbackOutput(OutputHandler):
     def emit(self, event_type: str, data: dict[str, Any]) -> None:
         """Call the callback with event data."""
         self.callback(event_type, data)
+
+
+class SessionTraceOutput(OutputHandler):
+    """Output observations to a session-based JSONL trace file.
+
+    Each session gets a unique UUID and saves events to a JSONL file
+    (one JSON object per line) for efficient incremental writes.
+    """
+
+    def __init__(self, traces_dir: str | Path = "./traces"):
+        """Initialize session trace output.
+
+        Args:
+            traces_dir: Directory to store trace files. Defaults to './traces'.
+        """
+        self.session_id = str(uuid.uuid4())
+        self.traces_dir = Path(traces_dir)
+        self.traces_dir.mkdir(parents=True, exist_ok=True)
+
+        self.file_path = self.traces_dir / f"{self.session_id}_session.json"
+
+        # Create empty file
+        self.file_path.touch(exist_ok=True)
+
+    def emit(self, event_type: str, data: dict[str, Any]) -> None:
+        """Append event as a single JSON line to the trace file."""
+        event = {
+            "timestamp": datetime.now().isoformat(),
+            "event_type": event_type,
+            "data": data,
+        }
+
+        # Append as single JSON line (JSONL format)
+        with self.file_path.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(event, ensure_ascii=False, default=str) + "\n")
+
+    @property
+    def session_uuid(self) -> str:
+        """Get the session UUID."""
+        return self.session_id
+
+    @property
+    def trace_file(self) -> Path:
+        """Get the trace file path."""
+        return self.file_path

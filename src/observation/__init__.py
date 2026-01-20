@@ -9,7 +9,9 @@ from src.observation.outputs import (
     ConsoleOutput,
     JsonFileOutput,
     OutputHandler,
+    SessionTraceOutput,
 )
+from src.observation.utils import read_trace_file
 
 __all__ = [
     "AgentObserver",
@@ -17,4 +19,6 @@ __all__ = [
     "ConsoleOutput",
     "JsonFileOutput",
     "OutputHandler",
+    "SessionTraceOutput",
+    "read_trace_file",
 ]
