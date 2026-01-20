@@ -1,0 +1,17 @@
+File Hash Test Document
+=======================
+
+This is a test document for demonstrating the file-hash skill.
+
+The file-hash skill calculates cryptographic hashes (MD5, SHA256, SHA512)
+of files, which is a task that AI cannot perform directly and requires
+script execution.
+
+Key features:
+- Supports multiple hash algorithms
+- Handles binary and text files
+- Efficient chunked reading for large files
+- Provides formatted output with file metadata
+
+This demonstrates that some operations truly require script execution
+and cannot be bypassed by the AI reading file content directly.

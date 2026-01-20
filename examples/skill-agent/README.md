@@ -53,7 +53,7 @@ A proof-of-concept demonstrating how to build a skill-based agent using the **De
 
 | Agent Request Path | Route Prefix | Actual File Path |
 |---|---|---|
-| `/skills/data-analysis/SKILL.md` | `/skills/` | `./skills/data-analysis/SKILL.md` |
+| `/skills/file-hash/SKILL.md` | `/skills/` | `./skills/file-hash/SKILL.md` |
 | `/workspace/sample.csv` | `/workspace/` | `./workspace/sample.csv` |
 | `/temp.txt` | (no match) | StateBackend temporary storage |
 
@@ -66,10 +66,10 @@ skills/
 │   └── scripts/
 │       └── extract_text.py   <- Executable script
 │
-└── data-analysis/
+└── file-hash/
     ├── SKILL.md
     └── scripts/
-        └── analyze.py
+        └── hash_file.py      <- Hash calculation script
 ```
 
 ## Execution Flow
@@ -101,7 +101,7 @@ skills/
       │  └─ ls("/workspace/"), read_file("/workspace/sample.csv")
       │
       ├─ Tool execution (bash_tool)
-      │  └─ python skills/data-analysis/scripts/analyze.py
+      │  └─ python skills/file-hash/scripts/hash_file.py
       │
       └─ Return result
 ```
@@ -141,21 +141,23 @@ Agent: [Using ls("/workspace/")]
        Files in workspace:
        - sample.csv
 
-You: 讀取 sample.csv 的內容
-Agent: [Using read_file("/workspace/sample.csv")]
-       Here's the content of sample.csv:
-       name,age,city,salary
+You: 讀取 test_document.txt 的內容
+Agent: [Using read_file("/workspace/test_document.txt")]
+       File Hash Test Document
+       =======================
        ...
 
-You: 分析 sample.csv
-Agent: I'll analyze the CSV file for you...
-       [Using read_file("/workspace/sample.csv") to check the file]
-       [Executing: python skills/data-analysis/scripts/analyze.py workspace/sample.csv]
+You: 計算 test_document.txt 的 SHA256 hash
+Agent: I'll calculate the hash for you...
+       [Executing: python skills/file-hash/scripts/hash_file.py workspace/test_document.txt --algo sha256]
 
-Agent: Here's the analysis of your CSV file:
-       - 10 records with columns: name, age, city, salary
-       - Average salary: 85,100
-       ...
+Agent: Here's the SHA256 hash of your file:
+       File: test_document.txt
+       Size: 585 B
+       SHA256: a3b2c1d4e5f6...
+
+       Note: This demonstrates mandatory script execution - the AI cannot compute
+       cryptographic hashes directly and must execute the hash script.
 ```
 
 ## Project Structure
@@ -171,28 +173,37 @@ examples/skill-agent/
 │   ├── __init__.py
 │   └── bash_tool.py             # Bash execution tool
 ├── workspace/                   # User files directory
-│   └── sample.csv               # Sample data for testing
+│   ├── sample.csv               # Sample data file
+│   ├── test_document.txt        # Test text file
+│   ├── test_image.png           # Test binary file
+│   └── test_large.bin           # Large test file
 └── skills/
     ├── pdf-processing/
     │   ├── SKILL.md             # Skill definition
     │   └── scripts/
     │       └── extract_text.py  # PDF extraction script
-    └── data-analysis/
+    └── file-hash/
         ├── SKILL.md
         └── scripts/
-            └── analyze.py       # Data analysis script
+            └── hash_file.py     # Hash calculation script
 ```
 
 ## Workspace
 
 Place your data files in the `workspace/` directory. The agent is configured to look for files there when you reference them without a full path.
 
+The workspace includes test files:
+- `test_document.txt` - Small text file for testing
+- `test_image.png` - Binary image file
+- `test_large.bin` - Large binary file (100KB)
+- `sample.csv` - Sample CSV data
+
 ```bash
-# Put your CSV files here
-cp mydata.csv workspace/
+# Put your files here
+cp myfile.txt workspace/
 
 # Then ask the agent
-You: 分析 mydata.csv
+You: 計算 myfile.txt 的 MD5 hash
 ```
 
 ## Adding New Skills
@@ -227,6 +238,38 @@ You: 分析 mydata.csv
 
 4. Restart the agent - the new skill will be auto-discovered.
 
+## Why File-Hash Skill Demonstrates Mandatory Script Execution
+
+The **file-hash** skill is specifically designed to demonstrate a scenario where **script execution is mandatory** - the AI cannot bypass it by reading files directly.
+
+### The Problem with Data Analysis Skills
+
+Previously, the example used a `data-analysis` skill that could analyze CSV files. However:
+- AI can read CSV files using the `read_file` tool
+- AI can parse CSV structure and perform statistical calculations in context
+- AI can bypass the analysis script entirely by processing data directly
+- This makes it unclear when script execution is truly needed
+
+### Why File Hashing Requires Script Execution
+
+Cryptographic hash calculation is fundamentally different because the AI **cannot**:
+- ❌ Compute MD5, SHA256, or SHA512 hashes (requires cryptographic algorithms)
+- ❌ Process binary files byte-by-byte (images, executables, archives)
+- ❌ Perform byte-level cryptographic operations
+- ❌ Implement hash algorithms in natural language
+
+**Result**: The AI **must** execute the hash script - no bypass is possible.
+
+### Practical Use Cases
+
+The file-hash skill demonstrates real-world scenarios where script execution is necessary:
+- **File Integrity Verification**: Verify downloaded files match expected checksums
+- **Duplicate Detection**: Find duplicate files across directories by comparing hashes
+- **Change Detection**: Detect if files have been modified
+- **Security Auditing**: Calculate hashes for security compliance
+
+This makes it an ideal demonstration of the skill system working as designed.
+
 ## Security Notes
 
 The `bash_tool` has safety restrictions:
@@ -245,12 +288,12 @@ To modify these restrictions, edit `tools/bash_tool.py`.
 | `langchain-openai` | Azure OpenAI integration |
 | `python-dotenv` | Environment variable loading |
 | `pypdf` (optional) | PDF text extraction |
-| `pandas` (optional) | Data analysis |
+
+**Note**: The file-hash skill uses only Python standard library (`hashlib`, `pathlib`, `sys`, `argparse`) and requires no additional dependencies.
 
 Install optional dependencies:
 ```bash
 uv sync --extra pdf    # For PDF processing
-uv sync --extra data   # For data analysis
 uv sync --extra all    # All optional deps
 ```
 

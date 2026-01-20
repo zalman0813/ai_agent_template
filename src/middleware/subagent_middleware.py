@@ -61,29 +61,36 @@ class CompiledSubAgent(TypedDict):
 
 
 # State keys to exclude when passing state to subagents
-_EXCLUDED_STATE_KEYS = ("messages", "todos")
+_EXCLUDED_STATE_KEYS = {"messages", "todos", "structured_response"}
 
-# Default system prompt explaining task tool usage
-TASK_SYSTEM_PROMPT = """## Subagent Task Tool
+# Default system prompt explaining task tool usage (based on official LangChain version)
+TASK_SYSTEM_PROMPT = """## `task` (subagent spawner)
 
-You have access to a `task` tool to launch subagents that handle isolated tasks.
+You have access to a `task` tool to launch short-lived subagents that handle isolated tasks. These agents are ephemeral — they live only for the duration of the task and return a single result.
 
 When to use the task tool:
-- Complex multi-step tasks that can be fully delegated
-- Independent tasks that can run in parallel
-- Tasks requiring focused reasoning or heavy token usage
-- When you only need the final output, not intermediate steps
+- When a task is complex and multi-step, and can be fully delegated in isolation
+- When a task is independent of other tasks and can run in parallel
+- When a task requires focused reasoning or heavy token/context usage that would bloat the orchestrator thread
+- When sandboxing improves reliability (e.g. code execution, structured searches, data formatting)
+- When you only care about the output of the subagent, and not the intermediate steps (ex. performing a lot of research and then returned a synthesized report, performing a series of computations or lookups to achieve a concise, relevant answer.)
 
 Subagent lifecycle:
-1. Spawn: Provide clear role, instructions, and expected output
-2. Run: Subagent completes the task autonomously
-3. Return: Subagent provides a single structured result
-4. Reconcile: Incorporate result into main thread
+1. **Spawn** → Provide clear role, instructions, and expected output
+2. **Run** → The subagent completes the task autonomously
+3. **Return** → The subagent provides a single structured result
+4. **Reconcile** → Incorporate or synthesize the result into the main thread
 
-When NOT to use:
-- Trivial tasks (a few tool calls)
-- When you need to see intermediate steps
-- When splitting adds latency without benefit"""
+When NOT to use the task tool:
+- If you need to see the intermediate reasoning or steps after the subagent has completed (the task tool hides them)
+- If the task is trivial (a few tool calls or simple lookup)
+- If delegating does not reduce token usage, complexity, or context switching
+- If splitting would add latency without benefit
+
+## Important Task Tool Usage Notes to Remember
+- Whenever possible, parallelize the work that you do. This is true for both tool_calls, and for tasks. Whenever you have independent steps to complete - make tool_calls, or kick off tasks (subagents) in parallel to accomplish them faster. This saves time for the user, which is incredibly important.
+- Remember to use the `task` tool to silo independent tasks within a multi-part objective.
+- You should use the `task` tool whenever you have a complex task that will take multiple steps, and is independent from other tasks that the agent needs to complete. These agents are highly competent and efficient."""
 
 # Template for task tool description
 TASK_TOOL_DESCRIPTION = """Launch a subagent to handle complex, isolated tasks.
@@ -126,7 +133,15 @@ def _build_subagents(
     if include_general_purpose:
         general_agent = create_agent(
             default_model,
-            system_prompt="You are a helpful assistant with access to various tools.",
+            system_prompt="""You are a helpful assistant with access to various tools and skills.
+
+When you receive a task, check if there are relevant skills available:
+1. Look for skills in the context that match the task
+2. Read the skill documentation using read_file() to understand how to use it
+3. If the skill provides scripts, execute them using the execute() tool
+4. Follow the skill's instructions exactly as documented
+
+Important: Some operations (like cryptographic hashing) REQUIRE script execution - you cannot perform them directly. Always check for and use available skill scripts.""",
             tools=default_tools,
             middleware=list(middleware_list),
         )
@@ -227,6 +242,7 @@ def _create_task_tool(
     ) -> tuple[Runnable, dict]:
         """Prepare state for subagent invocation."""
         subagent = agent_graphs[subagent_type]
+
         # Create new state excluding messages/todos
         subagent_state = {
             k: v
@@ -234,6 +250,7 @@ def _create_task_tool(
             if k not in _EXCLUDED_STATE_KEYS
         }
         subagent_state["messages"] = [HumanMessage(content=description)]
+
         return subagent, subagent_state
 
     def _stream_subagent_with_events(
