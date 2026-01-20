@@ -1,5 +1,7 @@
-"""Tools for skill-agent."""
+"""Tools for skill-agent.
 
-from .bash_tool import bash_tool
+Note: Command execution is now handled by ExecutableCompositeBackend,
+which provides the 'execute' tool automatically via FilesystemMiddleware.
+"""
 
-__all__ = ["bash_tool"]
+__all__ = []
