@@ -79,3 +79,42 @@ Deep agents are characterized by four components:
 - **wrap_tool_call**: Custom middleware hook for intercepting tool execution
 - **args_schema**: Pydantic model for strict input validation
 - **handle_tool_error**: Tool-level error handling configuration
+
+## Agent Skills (Open Standard)
+
+### Official Specification
+- https://agentskills.io/home
+- https://agentskills.io/specification
+- https://agentskills.io/what-are-skills
+- https://agentskills.io/integrate-skills
+
+### Anthropic Implementation
+- https://github.com/anthropics/skills
+- https://www.anthropic.com/engineering/equipping-agents-for-the-real-world-with-agent-skills
+- https://docs.anthropic.com/en/docs/agents-and-tools/agent-skills/overview
+
+### GitHub Specification
+- https://github.com/agentskills/agentskills
+- https://github.com/agentskills/agentskills/tree/main/skills-ref
+
+### Key Concepts
+- **Open Standard**: October 2025 by Anthropic, December 2025 published at agentskills.io
+- **SKILL.md files**: Markdown-based skill definitions with YAML frontmatter
+- **Supported Platforms**: Claude Code, Claude.ai, GitHub, Cursor, VS Code, OpenAI Codex, Gemini CLI, Goose, Letta, OpenCode, Amp, Factory
+
+## LangChain Deep Agents SkillsMiddleware
+
+### Official Documentation
+- https://docs.langchain.com/oss/python/deepagents/middleware
+- https://reference.langchain.com/python/deepagents/middleware/skills/
+- https://www.blog.langchain.com/using-skills-with-deep-agents/
+
+### GitHub
+- https://github.com/langchain-ai/deepagents
+- https://github.com/langchain-ai/deepagents-quickstarts
+
+### Key Concepts
+- **SkillsMiddleware**: Middleware for loading and exposing agent skills to the system prompt
+- **Progressive disclosure**: Only YAML frontmatter loads by default; full SKILL.md read on demand
+- **Package**: `deepagents.middleware.skills.SkillsMiddleware`
+- **Introduced**: November 2025 (as part of Deep Agents framework)
