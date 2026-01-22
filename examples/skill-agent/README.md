@@ -3,11 +3,19 @@
 A proof-of-concept demonstrating how to build a skill-based agent using the **Deep Agents SDK**:
 
 - **deepagents** - Official SDK for skill-based agents
+- **DockerBackend** - Sandboxed execution environment in Docker containers
 - **CompositeBackend** - Route-based path resolution for multiple directories
 - **FilesystemMiddleware** - File tools (ls, read_file, write_file, etc.)
 - **SkillsMiddleware** - Skill discovery and loading
 - **Azure OpenAI** - LLM backend
-- **Bash Tool** - Script execution
+
+## ⚠️ Breaking Change: Docker-Based Execution
+
+**Version 2.0** introduces Docker-based sandboxed execution:
+- **New requirement**: Docker must be installed and running
+- **Migration**: See [Docker Setup Guide](backends/DOCKER_SETUP.md) for setup instructions
+- **Benefits**: Isolated execution, reproducible environment, enhanced security
+- **Removed**: `ExecutableCompositeBackend` and monkey patches (cleaner codebase)
 
 ## Architecture
 
@@ -28,10 +36,13 @@ A proof-of-concept demonstrating how to build a skill-based agent using the **De
 ┌────────────────────────────────────────────────────────────┐
 │                    CompositeBackend                        │
 │                                                            │
-│  Route-based path resolution:                              │
-│  /skills/*    → FilesystemBackend(root_dir="./skills")    │
-│  /workspace/* → FilesystemBackend(root_dir="./workspace") │
-│  default      → StateBackend (temporary storage)          │
+│  Route-based path resolution + sandboxed execution:        │
+│  /skills/*    → FilesystemBackend("./skills") [host]      │
+│  /workspace/* → FilesystemBackend("./workspace") [host]   │
+│  default      → DockerBackend (sandboxed execution)       │
+│                                                            │
+│  DockerBackend: skill-agent:latest container               │
+│  Volumes: /skills, /workspace mounted from host            │
 └────────────────────────────────────────────────────────────┘
                               │
         ┌─────────────────────┴─────────────────────┐
@@ -77,13 +88,17 @@ skills/
 ```
 1. Startup
    └─ create_skill_agent()
+      ├─ DockerBackend (auto-creates/starts container)
+      │  ├─ Container: skill-agent-container
+      │  ├─ Image: skill-agent:latest
+      │  └─ Volumes: /skills, /workspace from host
       ├─ CompositeBackend with routes:
-      │  ├─ /skills/    → FilesystemBackend("./skills")
-      │  ├─ /workspace/ → FilesystemBackend("./workspace")
-      │  └─ default     → StateBackend
+      │  ├─ /skills/    → FilesystemBackend("./skills") [host reads]
+      │  ├─ /workspace/ → FilesystemBackend("./workspace") [host reads]
+      │  └─ default     → DockerBackend [sandboxed execution]
       ├─ FilesystemMiddleware (file tools)
-      ├─ SkillsMiddleware(backend, sources=["./skills"])
-      └─ create_deep_agent(model, tools, middleware, backend)
+      ├─ SkillsMiddleware(backend, sources=["/skills/"])
+      └─ create_agent(model, tools=[], middleware)
 
 2. Conversation
    └─ agent.invoke({"messages": [...]})
@@ -99,14 +114,27 @@ skills/
       │
       ├─ File tools via FilesystemMiddleware
       │  └─ ls("/workspace/"), read_file("/workspace/sample.csv")
+      │     [Routes to FilesystemBackend on host - fast reads]
       │
-      ├─ Tool execution (bash_tool)
-      │  └─ python skills/file-hash/scripts/hash_file.py
+      ├─ Tool execution (execute via FilesystemMiddleware)
+      │  └─ execute("python /skills/file-hash/scripts/hash_file.py /workspace/test_document.txt")
+      │     [Delegates to DockerBackend - sandboxed in container]
+      │     [Container accesses files via volumes]
       │
       └─ Return result
 ```
 
 ## Quick Start
+
+### Prerequisites
+
+- **Docker**: Required for sandboxed execution
+  - [Install Docker Desktop](https://www.docker.com/products/docker-desktop) (macOS/Windows)
+  - [Install Docker Engine](https://docs.docker.com/engine/install/) (Linux)
+  - Verify: `docker --version`
+
+- **Python 3.11+**: Required for running the agent
+- **UV**: Python package manager (recommended)
 
 ### 1. Install Dependencies
 
@@ -115,7 +143,18 @@ cd examples/skill-agent
 uv sync
 ```
 
-### 2. Configure Environment
+### 2. Build Docker Image
+
+```bash
+# Build custom Docker image for skill execution
+docker build -t skill-agent:latest .
+```
+
+This creates a sandboxed environment with Python 3.11 and common dependencies.
+
+**Note**: The agent will auto-create and start the container on first run.
+
+### 3. Configure Environment
 
 ```bash
 cp .env.example .env
@@ -127,13 +166,16 @@ Required variables:
 - `AZURE_OPENAI_ENDPOINT` - e.g., `https://your-resource.openai.azure.com/`
 - `AZURE_OPENAI_DEPLOYMENT_NAME` - e.g., `gpt-4o`
 
-### 3. Run the Agent
+### 4. Run the Agent
 
 ```bash
 uv run python main.py
 ```
 
-### 4. Example Interactions
+**First run**: The agent will automatically create and start the Docker container (takes ~2 seconds).
+**Subsequent runs**: The agent reuses the existing container (instant startup).
+
+### 5. Example Interactions
 
 ```
 You: 列出 workspace 目錄的檔案
@@ -149,15 +191,15 @@ Agent: [Using read_file("/workspace/test_document.txt")]
 
 You: 計算 test_document.txt 的 SHA256 hash
 Agent: I'll calculate the hash for you...
-       [Executing: python skills/file-hash/scripts/hash_file.py workspace/test_document.txt --algo sha256]
+       [Executing in Docker container: python /skills/file-hash/scripts/hash_file.py /workspace/test_document.txt --algo sha256]
 
 Agent: Here's the SHA256 hash of your file:
        File: test_document.txt
        Size: 585 B
        SHA256: a3b2c1d4e5f6...
 
-       Note: This demonstrates mandatory script execution - the AI cannot compute
-       cryptographic hashes directly and must execute the hash script.
+       Note: This demonstrates mandatory script execution in a sandboxed Docker container.
+       The AI cannot compute cryptographic hashes directly and must execute the hash script.
 ```
 
 ## Project Structure
@@ -166,12 +208,14 @@ Agent: Here's the SHA256 hash of your file:
 examples/skill-agent/
 ├── README.md                    # This file
 ├── pyproject.toml               # UV package config
+├── Dockerfile                   # Docker image for sandboxed execution
 ├── .env.example                 # Environment template
 ├── main.py                      # CLI entry point
 ├── agent.py                     # Agent creation with SDK
-├── tools/
+├── backends/                    # Backend implementations
 │   ├── __init__.py
-│   └── bash_tool.py             # Bash execution tool
+│   ├── docker_backend.py        # DockerBackend for sandboxed execution
+│   └── DOCKER_SETUP.md          # Docker setup guide
 ├── workspace/                   # User files directory
 │   ├── sample.csv               # Sample data file
 │   ├── test_document.txt        # Test text file
@@ -272,13 +316,22 @@ This makes it an ideal demonstration of the skill system working as designed.
 
 ## Security Notes
 
-The `bash_tool` has safety restrictions:
+### Docker Sandboxing
 
-- **Allowed commands**: `python`, `python3`, `cat`, `head`, `tail`, `ls`, `pwd`, `echo`, `grep`, `wc`
-- **Blocked patterns**: Destructive commands like `rm -rf /`
-- **Timeout**: 30 seconds default
+All skill executions run in an isolated Docker container:
 
-To modify these restrictions, edit `tools/bash_tool.py`.
+- **Isolated environment**: Code runs in a separate container, not on the host
+- **Resource limits**: Docker can limit CPU, memory, and network access
+- **Volume-based access**: Only `/skills` and `/workspace` are accessible
+- **Reproducible**: Consistent environment defined by `Dockerfile`
+
+### Execution Safety
+
+- **Timeout**: Commands time out after 60 seconds (configurable)
+- **Container lifecycle**: Auto-created and managed by DockerBackend
+- **Volume mounts**: Only specified directories are accessible in container
+
+For advanced security configuration (resource limits, read-only volumes, network isolation), see [Docker Setup Guide](backends/DOCKER_SETUP.md).
 
 ## Dependencies
 

@@ -1,15 +1,16 @@
 """Agent creation with manual middleware configuration.
 
 Architecture:
-1. ExecutableCompositeBackend - Routes paths to appropriate backends + command execution
+1. DockerBackend + CompositeBackend - Sandboxed execution with path routing
    Backend Configuration:
-   - Default: FilesystemBackend(.agent_temp/) - Temporary file storage + execution support
-   - /skills/: FilesystemBackend(./skills) - Read-only skill definitions
-   - /workspace/: FilesystemBackend(./workspace) - User workspace files
+   - Default: DockerBackend (sandboxed execution in Docker container)
+   - /skills/: FilesystemBackend(./skills) - Fast host reads for skill definitions
+   - /workspace/: FilesystemBackend(./workspace) - Fast host reads for user files
+   - Docker volumes ensure container can access both /skills and /workspace during execution
 2. Manual middleware stack:
    - TodoListMiddleware - Provides todo management tools
    - SkillsMiddleware - Automatic skill discovery and documentation injection
-   - FixedFilesystemMiddleware - Provides file tools with fixed execute detection
+   - FilesystemMiddleware - Provides file tools and execute support
    - CustomSubAgentMiddleware - Provides task delegation with event streaming
    - SummarizationMiddleware - Automatic conversation summarization
    - AnthropicPromptCachingMiddleware - Prompt caching for Claude models
@@ -32,12 +33,13 @@ from langchain.agents.middleware import TodoListMiddleware, SummarizationMiddlew
 from langchain_anthropic.middleware import AnthropicPromptCachingMiddleware
 from deepagents.backends import StateBackend
 from deepagents.backends.filesystem import FilesystemBackend
+from deepagents.backends.composite import CompositeBackend
 from deepagents.middleware.patch_tool_calls import PatchToolCallsMiddleware
 from deepagents.middleware.skills import SkillsMiddleware
+from deepagents.middleware.filesystem import FilesystemMiddleware
 from langchain_openai import AzureChatOpenAI
 
-from backends import ExecutableCompositeBackend
-from middleware import FixedFilesystemMiddleware
+from backends import DockerBackend
 from src.middleware import CustomSubAgentMiddleware
 
 if TYPE_CHECKING:
@@ -71,7 +73,7 @@ def create_skill_agent(
     """Create agent with manual middleware configuration.
 
     Architecture:
-    1. ExecutableCompositeBackend - Routes paths + command execution with path translation
+    1. DockerBackend + CompositeBackend - Sandboxed execution with path routing
     2. Manual middleware stack with CustomSubAgentMiddleware for event visibility
     3. create_agent - Assembles the LangGraph agent
 
@@ -91,28 +93,39 @@ def create_skill_agent(
     # Step 1: Azure OpenAI model
     model = create_azure_model()
 
-    # Step 2: ExecutableCompositeBackend with route-based path resolution + execution
-    # Routes:
-    #   /skills/*    -> FilesystemBackend(./skills)
-    #   /workspace/* -> FilesystemBackend(./workspace)
-    #   default      -> FilesystemBackend(.agent_temp/) - Temporary storage + execution support
-    # Execution: Commands run from project_root with automatic path translation
+    # Step 2: DockerBackend + CompositeBackend for sandboxed execution
+    # Architecture:
+    #   - DockerBackend: Provides sandboxed execution in Docker container
+    #   - Routes: Optimize file reads by routing to host FilesystemBackend
+    #     /skills/*    -> FilesystemBackend(./skills) - Fast host reads
+    #     /workspace/* -> FilesystemBackend(./workspace) - Fast host reads
+    #   - Volumes: Enable container access to host directories during execution
+    #
+    # Flow:
+    #   1. read("/skills/script.py") → FilesystemBackend (host, fast)
+    #   2. execute("python /skills/script.py") → DockerBackend (container, via volume)
+    #   3. Volume ensures container can access /skills/script.py from host
+    #
     # Note: Create backend with lambda factory for StateBackend (needs runtime)
 
-    # Create temporary directory for default backend
-    temp_dir = project_root / ".agent_temp"
-    temp_dir.mkdir(exist_ok=True)
+    # Create DockerBackend with auto-start (will create/start container if needed)
+    docker_backend = DockerBackend(
+        image="skill-agent:latest",
+        container_name="skill-agent-container",
+        workdir="/workspace",
+        volumes={
+            str(workspace_path): "/workspace",
+            str(skills_path): "/skills",
+        },
+        auto_start=True,
+    )
 
-    backend_factory = lambda rt: ExecutableCompositeBackend(
-        default=FilesystemBackend(
-            root_dir=str(temp_dir),
-            virtual_mode=True,
-        ),
+    backend_factory = lambda rt: CompositeBackend(
+        default=docker_backend,
         routes={
             "/skills/": FilesystemBackend(root_dir=str(skills_path), virtual_mode=True),
             "/workspace/": FilesystemBackend(root_dir=str(workspace_path), virtual_mode=True),
         },
-        execution_cwd=project_root,
     )
 
     # Step 3: Build middleware stack manually (replicating create_deep_agent behavior)
@@ -124,8 +137,8 @@ def create_skill_agent(
             backend=backend_factory,  # Reuse same backend as FilesystemMiddleware
             sources=["/skills/"]  # Path will be routed to actual skills directory
         ),
-        # File operations and command execution (with fixed execute detection)
-        FixedFilesystemMiddleware(backend=backend_factory),
+        # File operations and command execution (sandboxed via DockerBackend)
+        FilesystemMiddleware(backend=backend_factory),
         # Subagent delegation with event streaming
         CustomSubAgentMiddleware(
             default_model=model,
@@ -141,7 +154,7 @@ def create_skill_agent(
                     backend=backend_factory,
                     sources=["/skills/"]
                 ),
-                FixedFilesystemMiddleware(backend=backend_factory),
+                FilesystemMiddleware(backend=backend_factory),
                 SummarizationMiddleware(
                     model=model,
                     max_tokens_before_summary=170000,

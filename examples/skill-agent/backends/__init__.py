@@ -1,5 +1,5 @@
-"""Backends for skill agent with execution support."""
+"""Backends for skill agent with sandboxed execution support."""
 
-from .executable_composite import ExecutableCompositeBackend
+from .docker_backend import DockerBackend
 
-__all__ = ["ExecutableCompositeBackend"]
+__all__ = ["DockerBackend"]
