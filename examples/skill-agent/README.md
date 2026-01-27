@@ -7,15 +7,29 @@ A proof-of-concept demonstrating how to build a skill-based agent using the **De
 - **CompositeBackend** - Route-based path resolution for multiple directories
 - **FilesystemMiddleware** - File tools (ls, read_file, write_file, etc.)
 - **SkillsMiddleware** - Skill discovery and loading
+- **Web Search** - DuckDuckGo search integration for real-time information
+- **Multi-turn Conversation** - Persistent conversation memory via LangGraph checkpointer
 - **Azure OpenAI** - LLM backend
 
-## ⚠️ Breaking Change: Docker-Based Execution
+## Features
 
-**Version 2.0** introduces Docker-based sandboxed execution:
-- **New requirement**: Docker must be installed and running
-- **Migration**: See [Docker Setup Guide](backends/DOCKER_SETUP.md) for setup instructions
-- **Benefits**: Isolated execution, reproducible environment, enhanced security
-- **Removed**: `ExecutableCompositeBackend` and monkey patches (cleaner codebase)
+### Core Capabilities
+
+| Feature | Description |
+|---------|-------------|
+| **Sandboxed Execution** | All commands run in isolated Docker containers |
+| **Skill System** | Auto-discovery of skills from `/skills/` directory |
+| **File Operations** | Read, write, edit files in `/workspace/` |
+| **Web Search** | Real-time search via DuckDuckGo |
+| **Multi-turn Memory** | Conversation history persisted across turns |
+| **PDF Generation** | Markdown to PDF conversion (WeasyPrint) |
+
+### Available Skills
+
+| Skill | Description |
+|-------|-------------|
+| `file-hash` | Calculate MD5/SHA256/SHA512 hashes of files |
+| `content-research-writer` | Research topics and produce written content with PDF output |
 
 ## Architecture
 
@@ -23,12 +37,12 @@ A proof-of-concept demonstrating how to build a skill-based agent using the **De
 
 ```
 ┌────────────────────────────────────────────────────────────┐
-│                    create_deep_agent()                     │
+│                    create_skill_agent()                    │
 │                                                            │
 │  model ──────────────────────┐                            │
-│  tools ──────────────────────┼──→ CompiledStateGraph      │
+│  tools (DuckDuckGoSearch) ───┼──→ CompiledStateGraph      │
 │  middleware ─────────────────┤    (LangGraph)             │
-│  backend ────────────────────┤                            │
+│  checkpointer ───────────────┤                            │
 │  system_prompt ──────────────┘                            │
 └────────────────────────────────────────────────────────────┘
                               │
@@ -57,71 +71,40 @@ A proof-of-concept demonstrating how to build a skill-based agent using the **De
 │  - edit_file          │               │  to load skill content│
 │  - glob               │               │                       │
 │  - grep               │               │                       │
+│  - execute            │               │                       │
 └───────────────────────┘               └───────────────────────┘
 ```
 
-### Path Resolution
+### Multi-turn Conversation Flow
 
-| Agent Request Path | Route Prefix | Actual File Path |
-|---|---|---|
-| `/skills/file-hash/SKILL.md` | `/skills/` | `./skills/file-hash/SKILL.md` |
-| `/workspace/sample.csv` | `/workspace/` | `./workspace/sample.csv` |
-| `/temp.txt` | (no match) | StateBackend temporary storage |
+```
+┌─────────────────────────────────────────────────────────────┐
+│                    InMemorySaver (Checkpointer)            │
+│                                                             │
+│  thread_id: "abc-123"                                       │
+│  ┌─────────────────────────────────────────────────────────┐
+│  │ Turn 1: User: "我叫小明"                                  │
+│  │         Agent: "你好小明！有什麼可以幫你的？"              │
+│  ├─────────────────────────────────────────────────────────┤
+│  │ Turn 2: User: "我叫什麼名字？"                            │
+│  │         Agent: "你叫小明。" (記得之前的對話)              │
+│  └─────────────────────────────────────────────────────────┘
+└─────────────────────────────────────────────────────────────┘
+```
 
 ### Skills Directory Structure
 
 ```
 skills/
-├── pdf-processing/
+├── file-hash/
 │   ├── SKILL.md              <- Skill metadata & instructions
 │   └── scripts/
-│       └── extract_text.py   <- Executable script
+│       └── hash_file.py      <- Hash calculation script
 │
-└── file-hash/
-    ├── SKILL.md
+└── content-research-writer/
+    ├── SKILL.md              <- Research & writing workflow
     └── scripts/
-        └── hash_file.py      <- Hash calculation script
-```
-
-## Execution Flow
-
-```
-1. Startup
-   └─ create_skill_agent()
-      ├─ DockerBackend (auto-creates/starts container)
-      │  ├─ Container: skill-agent-container
-      │  ├─ Image: skill-agent:latest
-      │  └─ Volumes: /skills, /workspace from host
-      ├─ CompositeBackend with routes:
-      │  ├─ /skills/    → FilesystemBackend("./skills") [host reads]
-      │  ├─ /workspace/ → FilesystemBackend("./workspace") [host reads]
-      │  └─ default     → DockerBackend [sandboxed execution]
-      ├─ FilesystemMiddleware (file tools)
-      ├─ SkillsMiddleware(backend, sources=["/skills/"])
-      └─ create_agent(model, tools=[], middleware)
-
-2. Conversation
-   └─ agent.invoke({"messages": [...]})
-      │
-      ├─ SkillsMiddleware.before_agent()
-      │  └─ Scan skills/ for SKILL.md
-      │  └─ Parse YAML frontmatter (name, description)
-      │
-      ├─ SkillsMiddleware.wrap_model_call()
-      │  └─ Inject <available_skills> into system prompt
-      │
-      ├─ Model decides which skill to use
-      │
-      ├─ File tools via FilesystemMiddleware
-      │  └─ ls("/workspace/"), read_file("/workspace/sample.csv")
-      │     [Routes to FilesystemBackend on host - fast reads]
-      │
-      ├─ Tool execution (execute via FilesystemMiddleware)
-      │  └─ execute("python /skills/file-hash/scripts/hash_file.py /workspace/test_document.txt")
-      │     [Delegates to DockerBackend - sandboxed in container]
-      │     [Container accesses files via volumes]
-      │
-      └─ Return result
+        └── generate_pdf.py   <- Markdown to PDF conversion
 ```
 
 ## Quick Start
@@ -150,7 +133,10 @@ uv sync
 docker build -t skill-agent:latest .
 ```
 
-This creates a sandboxed environment with Python 3.11 and common dependencies.
+This creates a sandboxed environment with:
+- Python 3.11
+- Data science packages (pandas, numpy, matplotlib, etc.)
+- PDF generation (markdown2, weasyprint)
 
 **Note**: The agent will auto-create and start the container on first run.
 
@@ -177,29 +163,54 @@ uv run python main.py
 
 ### 5. Example Interactions
 
+#### File Operations
 ```
 You: 列出 workspace 目錄的檔案
 Agent: [Using ls("/workspace/")]
        Files in workspace:
        - sample.csv
+       - test_document.txt
+```
 
-You: 讀取 test_document.txt 的內容
-Agent: [Using read_file("/workspace/test_document.txt")]
-       File Hash Test Document
-       =======================
-       ...
+#### Web Search
+```
+You: 搜尋 LangChain 最新版本的功能
+Agent: [Using duckduckgo_search]
+       Based on my search, LangChain v0.3 introduces...
+```
 
+#### Multi-turn Conversation
+```
+You: 我叫小明
+Agent: 你好小明！很高興認識你。有什麼我可以幫忙的嗎？
+
+You: 我叫什麼名字？
+Agent: 你叫小明。
+```
+
+#### Content Research & PDF Generation
+```
+You: 寫一篇關於 AI Agent 架構的技術文章，產出 PDF
+Agent: I'll help you create a technical article about AI Agent architecture.
+
+       [Step 1: Creating outline...]
+       [Step 2: Researching with web search...]
+       [Step 3: Writing content...]
+       [Step 4: Generating PDF...]
+
+       Done! The article has been saved to:
+       - /workspace/content.md (Markdown)
+       - /workspace/content.pdf (PDF)
+```
+
+#### File Hash Calculation
+```
 You: 計算 test_document.txt 的 SHA256 hash
-Agent: I'll calculate the hash for you...
-       [Executing in Docker container: python /skills/file-hash/scripts/hash_file.py /workspace/test_document.txt --algo sha256]
+Agent: [Executing in Docker: python /skills/file-hash/scripts/hash_file.py ...]
 
-Agent: Here's the SHA256 hash of your file:
        File: test_document.txt
        Size: 585 B
        SHA256: a3b2c1d4e5f6...
-
-       Note: This demonstrates mandatory script execution in a sandboxed Docker container.
-       The AI cannot compute cryptographic hashes directly and must execute the hash script.
 ```
 
 ## Project Structure
@@ -219,35 +230,17 @@ examples/skill-agent/
 ├── workspace/                   # User files directory
 │   ├── sample.csv               # Sample data file
 │   ├── test_document.txt        # Test text file
-│   ├── test_image.png           # Test binary file
-│   └── test_large.bin           # Large test file
+│   └── *.md, *.pdf              # Generated content files
+├── traces/                      # Session trace logs
 └── skills/
-    ├── pdf-processing/
-    │   ├── SKILL.md             # Skill definition
+    ├── file-hash/
+    │   ├── SKILL.md
     │   └── scripts/
-    │       └── extract_text.py  # PDF extraction script
-    └── file-hash/
+    │       └── hash_file.py
+    └── content-research-writer/
         ├── SKILL.md
         └── scripts/
-            └── hash_file.py     # Hash calculation script
-```
-
-## Workspace
-
-Place your data files in the `workspace/` directory. The agent is configured to look for files there when you reference them without a full path.
-
-The workspace includes test files:
-- `test_document.txt` - Small text file for testing
-- `test_image.png` - Binary image file
-- `test_large.bin` - Large binary file (100KB)
-- `sample.csv` - Sample CSV data
-
-```bash
-# Put your files here
-cp myfile.txt workspace/
-
-# Then ask the agent
-You: 計算 myfile.txt 的 MD5 hash
+            └── generate_pdf.py
 ```
 
 ## Adding New Skills
@@ -268,7 +261,7 @@ You: 計算 myfile.txt 的 MD5 hash
 
    ## Usage
    ```bash
-   python scripts/my_script.py <args>
+   python /skills/my-skill/scripts/my_script.py <args>
    ```
    ```
 
@@ -282,37 +275,39 @@ You: 計算 myfile.txt 的 MD5 hash
 
 4. Restart the agent - the new skill will be auto-discovered.
 
-## Why File-Hash Skill Demonstrates Mandatory Script Execution
+## Configuration
 
-The **file-hash** skill is specifically designed to demonstrate a scenario where **script execution is mandatory** - the AI cannot bypass it by reading files directly.
+### Conversation Memory
 
-### The Problem with Data Analysis Skills
+The agent uses `InMemorySaver` for conversation persistence:
 
-Previously, the example used a `data-analysis` skill that could analyze CSV files. However:
-- AI can read CSV files using the `read_file` tool
-- AI can parse CSV structure and perform statistical calculations in context
-- AI can bypass the analysis script entirely by processing data directly
-- This makes it unclear when script execution is truly needed
+```python
+from langgraph.checkpoint.memory import InMemorySaver
 
-### Why File Hashing Requires Script Execution
+checkpointer = InMemorySaver()
+agent = create_skill_agent(
+    ...,
+    checkpointer=checkpointer,
+)
 
-Cryptographic hash calculation is fundamentally different because the AI **cannot**:
-- ❌ Compute MD5, SHA256, or SHA512 hashes (requires cryptographic algorithms)
-- ❌ Process binary files byte-by-byte (images, executables, archives)
-- ❌ Perform byte-level cryptographic operations
-- ❌ Implement hash algorithms in natural language
+# Each session gets a unique thread_id
+config = {"configurable": {"thread_id": "session_123"}}
+result = agent.invoke(inputs, config=config)
+```
 
-**Result**: The AI **must** execute the hash script - no bypass is possible.
+For production, consider using persistent checkpointers:
+- `SqliteSaver` - SQLite-based persistence
+- `PostgresSaver` - PostgreSQL-based persistence
 
-### Practical Use Cases
+### Web Search
 
-The file-hash skill demonstrates real-world scenarios where script execution is necessary:
-- **File Integrity Verification**: Verify downloaded files match expected checksums
-- **Duplicate Detection**: Find duplicate files across directories by comparing hashes
-- **Change Detection**: Detect if files have been modified
-- **Security Auditing**: Calculate hashes for security compliance
+The agent includes DuckDuckGo search (no API key required):
 
-This makes it an ideal demonstration of the skill system working as designed.
+```python
+from langchain_community.tools import DuckDuckGoSearchResults
+
+search_tool = DuckDuckGoSearchResults(max_results=5)
+```
 
 ## Security Notes
 
@@ -339,15 +334,46 @@ For advanced security configuration (resource limits, read-only volumes, network
 |---------|---------|
 | `deepagents` | Deep Agents SDK (CompositeBackend, FilesystemMiddleware, SkillsMiddleware) |
 | `langchain-openai` | Azure OpenAI integration |
+| `langchain-community` | DuckDuckGo search tool |
+| `ddgs` | DuckDuckGo search backend |
 | `python-dotenv` | Environment variable loading |
 | `pypdf` (optional) | PDF text extraction |
-
-**Note**: The file-hash skill uses only Python standard library (`hashlib`, `pathlib`, `sys`, `argparse`) and requires no additional dependencies.
+| `markdown2` (optional) | Markdown to HTML conversion |
+| `weasyprint` (optional) | HTML to PDF generation |
 
 Install optional dependencies:
 ```bash
-uv sync --extra pdf    # For PDF processing
+uv sync --extra pdf    # For PDF processing & generation
 uv sync --extra all    # All optional deps
+```
+
+## Troubleshooting
+
+### DuckDuckGo Search Error
+
+If you see `Could not import ddgs python package`:
+```bash
+uv sync  # Ensure ddgs is installed
+```
+
+### Docker Container Not Starting
+
+```bash
+# Check Docker is running
+docker ps
+
+# Rebuild image if needed
+docker build -t skill-agent:latest .
+
+# Check container logs
+docker logs skill-agent-container
+```
+
+### PDF Generation Fails
+
+Ensure WeasyPrint dependencies are installed in the Docker image:
+```bash
+docker build -t skill-agent:latest .  # Rebuild image
 ```
 
 ## License

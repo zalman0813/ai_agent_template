@@ -1,7 +1,11 @@
 """Custom SubAgent Middleware implementation.
 
-This middleware provides subagent capabilities without using create_deep_agent.
-It follows LangChain v1.0 middleware patterns.
+This middleware provides subagent capabilities using compile-time resolution.
+Follows official LangChain SubAgentMiddleware pattern with added trace event support.
+
+Architecture:
+- Domain Layer: SubAgentSpec (type definition)
+- Infrastructure Layer: CustomSubAgentMiddleware (LangChain integration + trace events)
 """
 
 import asyncio
@@ -25,45 +29,87 @@ if TYPE_CHECKING:
     from src.observation.outputs import OutputHandler
 
 
+# ==================== Domain Layer ====================
+
+
 class SubAgentSpec(TypedDict):
-    """Specification for a subagent."""
+    """SubAgent specification for compile-time resolution.
+
+    Supports both compile-time configuration and pre-compiled runnables.
+    """
 
     name: str
-    """The name of the subagent."""
+    """The unique identifier for this subagent."""
 
     description: str
     """Description shown to main agent for deciding when to use this subagent."""
 
-    system_prompt: str
-    """The system prompt for the subagent."""
+    # Pre-compiled runnable (if provided, ignores other configuration)
+    runnable: NotRequired[Runnable]
+    """Optional pre-compiled runnable. If provided, other config is ignored."""
 
-    tools: Sequence[BaseTool | Callable | dict[str, Any]]
-    """Tools available to this subagent."""
+    # Compile-time configuration (optional overrides)
+    system_prompt: NotRequired[str]
+    """System prompt for the subagent. Defaults to GENERAL_PURPOSE_SYSTEM_PROMPT."""
 
-    model: NotRequired[str | BaseChatModel]
-    """Optional model override for this subagent."""
+    tools: NotRequired[Sequence[BaseTool | Callable | dict[str, Any]]]
+    """Explicit tools for this subagent. Defaults to default_tools."""
 
     middleware: NotRequired[list[AgentMiddleware]]
-    """Optional additional middleware for this subagent."""
+    """Middleware for this subagent. Defaults to default_middleware."""
 
-
-class CompiledSubAgent(TypedDict):
-    """A pre-compiled subagent."""
-
-    name: str
-    """The name of the subagent."""
-
-    description: str
-    """Description of the subagent."""
-
-    runnable: Runnable
-    """The compiled runnable for the subagent."""
+    model: NotRequired[BaseChatModel]
+    """Model for this subagent. Defaults to default_model."""
 
 
 # State keys to exclude when passing state to subagents
 _EXCLUDED_STATE_KEYS = {"messages", "todos", "structured_response"}
 
-# Default system prompt explaining task tool usage (based on official LangChain version)
+
+# ==================== Helper Functions ====================
+
+
+def _get_message_text(msg) -> str:
+    """Safely extract text from any message type.
+
+    Handles AIMessage (.text), ToolMessage (.content), and various content formats
+    including Anthropic-style content blocks.
+    """
+    if msg is None:
+        return ""
+    # AIMessage has .text property
+    if hasattr(msg, "text"):
+        return msg.text or ""
+    # ToolMessage and others have .content
+    if hasattr(msg, "content"):
+        content = msg.content
+        if isinstance(content, str):
+            return content
+        if isinstance(content, list):
+            # Handle content blocks (e.g., Anthropic format)
+            return "".join(
+                block.get("text", "") if isinstance(block, dict) else str(block)
+                for block in content
+            )
+    return ""
+
+
+def _get_final_message_text(result: dict) -> str:
+    """Safely extract text from the last message in result.
+
+    Returns empty string if result has no messages or extraction fails.
+    """
+    messages = result.get("messages")
+    if not messages:
+        return ""
+    last_msg = messages[-1] if isinstance(messages, list) else messages
+    return _get_message_text(last_msg)
+
+
+# ==================== Constants ====================
+
+
+# Default system prompt explaining task tool usage
 TASK_SYSTEM_PROMPT = """## `task` (subagent spawner)
 
 You have access to a `task` tool to launch short-lived subagents that handle isolated tasks. These agents are ephemeral — they live only for the duration of the task and return a single result.
@@ -104,239 +150,260 @@ Usage:
 
 Each subagent invocation is stateless - provide complete instructions."""
 
+# System prompt for general-purpose subagent
+GENERAL_PURPOSE_SYSTEM_PROMPT = """You are a general-purpose subagent with full access to all available tools.
 
-def _build_subagents(
-    *,
-    default_model: str | BaseChatModel,
-    default_tools: Sequence[BaseTool | Callable | dict[str, Any]],
-    default_middleware: list[AgentMiddleware] | None,
-    subagents: list[SubAgentSpec | CompiledSubAgent],
-    include_general_purpose: bool,
-) -> tuple[dict[str, Runnable], list[str]]:
-    """Build subagent instances from specifications.
+## Your Role
 
-    Args:
-        default_model: Default model for subagents without model override.
-        default_tools: Default tools for the general-purpose subagent.
-        default_middleware: Middleware to apply to all subagents.
-        subagents: List of subagent specs or pre-compiled agents.
-        include_general_purpose: Whether to include a general-purpose subagent.
+You are spawned by a main agent to handle complex, multi-step tasks autonomously. You have access to the same tools as the main agent, making you the most capable subagent for tasks requiring:
+- Complex reasoning across multiple steps
+- Research and exploration followed by execution
+- File operations, code modifications, or data processing
+- Tasks that benefit from isolated context
 
-    Returns:
-        Tuple of (agents_dict, description_list).
+## Execution Model
+
+1. **Autonomous Execution**: Complete the entire task without user interaction
+2. **Return Results**: Provide a clear, structured response when done
+3. **No Nesting**: You cannot spawn other subagents - complete the work yourself
+
+## Working with Skills
+
+When skills are available in the context:
+1. Read the skill documentation (SKILL.md) to understand capabilities
+2. Use skill scripts via execute() when provided
+3. Some operations REQUIRE script execution (cryptographic hashing, binary processing)
+
+## Task Completion Guidelines
+
+1. **Be Thorough**: Complete all aspects of the assigned task
+2. **Be Efficient**: Minimize unnecessary steps while ensuring quality
+3. **Be Clear**: Structure your final response for easy consumption by the main agent
+4. **Handle Errors**: If something fails, explain what happened and what was attempted
+
+## Output Format
+
+When completing your task, provide:
+1. **Summary**: Brief overview of what was accomplished
+2. **Details**: Key findings, results, or changes made
+3. **Next Steps** (if applicable): Any follow-up actions recommended"""
+
+
+# ==================== Infrastructure Layer ====================
+
+
+class CustomSubAgentMiddleware(AgentMiddleware):
+    """Middleware that provides subagent capabilities via a `task` tool.
+
+    Uses compile-time resolution: subagents are created during initialization
+    using explicit default_model, default_tools, and default_middleware.
+
+    Key features:
+    - Compile-time agent creation (no runtime resolution)
+    - Support for pre-compiled runnables
+    - Optional trace event streaming for visibility
+    - Clean, simple API following official patterns
+
+    Example:
+        ```python
+        subagent_middleware = CustomSubAgentMiddleware(
+            default_model=model,
+            default_tools=[read_file, write_file, execute],
+            default_middleware=[SummarizationMiddleware(...)],
+            include_general_purpose=True,
+            stream_subagent_events=True,
+            output_handlers=[trace_handler],
+        )
+        ```
     """
-    middleware_list = default_middleware or []
-    agents: dict[str, Runnable] = {}
-    descriptions: list[str] = []
 
-    # Create general-purpose subagent if enabled
-    if include_general_purpose:
-        general_agent = create_agent(
-            default_model,
-            system_prompt="""You are a helpful assistant with access to various tools and skills.
+    def __init__(
+        self,
+        *,
+        default_model: BaseChatModel,
+        default_tools: Sequence[BaseTool | Callable | dict[str, Any]] | None = None,
+        default_middleware: list[AgentMiddleware] | None = None,
+        subagents: list[SubAgentSpec] | None = None,
+        system_prompt: str | None = TASK_SYSTEM_PROMPT,
+        include_general_purpose: bool = True,
+        task_description: str | None = None,
+        stream_subagent_events: bool = False,
+        output_handlers: list["OutputHandler"] | None = None,
+        subagent_recursion_limit: int = 150,
+    ) -> None:
+        """Initialize the SubAgent Middleware.
 
-When you receive a task, check if there are relevant skills available:
-1. Look for skills in the context that match the task
-2. Read the skill documentation using read_file() to understand how to use it
-3. If the skill provides scripts, execute them using the execute() tool
-4. Follow the skill's instructions exactly as documented
+        Args:
+            default_model: Model for subagents (required).
+            default_tools: Default tools for subagents.
+            default_middleware: Default middleware for subagents.
+            subagents: List of custom subagent specifications.
+            system_prompt: System prompt addition explaining task tool usage.
+                Set to None to disable prompt injection.
+            include_general_purpose: Whether to include a general-purpose subagent.
+            task_description: Custom description for the task tool.
+            stream_subagent_events: Whether to emit subagent_start/end events.
+            output_handlers: Output handlers to receive subagent events.
+            subagent_recursion_limit: Max steps for subagent execution (default 150).
+        """
+        super().__init__()
+        self._default_model = default_model
+        self._default_tools = list(default_tools) if default_tools else []
+        self._default_middleware = list(default_middleware) if default_middleware else []
+        self._specs = subagents or []
+        self._include_general_purpose = include_general_purpose
+        self._system_prompt = system_prompt
+        self._stream_subagent_events = stream_subagent_events
+        self._output_handlers = output_handlers
+        self._subagent_recursion_limit = subagent_recursion_limit
 
-Important: Some operations (like cryptographic hashing) REQUIRE script execution - you cannot perform them directly. Always check for and use available skill scripts.""",
-            tools=default_tools,
-            middleware=list(middleware_list),
-        )
-        agents["general-purpose"] = general_agent
-        descriptions.append(
-            "- general-purpose: General-purpose agent for research and multi-step tasks"
-        )
+        # Compile subagents at initialization time
+        self._compiled_subagents = self._compile_subagents()
 
-    # Process custom subagents
-    for spec in subagents:
-        descriptions.append(f"- {spec['name']}: {spec['description']}")
+        # Build descriptions for task tool
+        descriptions = self._build_descriptions()
+        description_str = "\n".join(descriptions)
 
-        # Check if it's a pre-compiled agent
-        if "runnable" in spec:
-            compiled = spec  # type: CompiledSubAgent
-            agents[compiled["name"]] = compiled["runnable"]
-            continue
+        # Build tool description
+        if task_description is None:
+            tool_description = TASK_TOOL_DESCRIPTION.format(
+                available_agents=description_str
+            )
+        elif "{available_agents}" in task_description:
+            tool_description = task_description.format(available_agents=description_str)
+        else:
+            tool_description = task_description
 
-        # Build from spec
-        agent_spec = spec  # type: SubAgentSpec
-        _tools = agent_spec.get("tools", list(default_tools))
-        _model = agent_spec.get("model", default_model)
-        _middleware = [
-            *middleware_list,
-            *agent_spec.get("middleware", []),
-        ]
+        # Create the task tool
+        self.tools = [self._create_task_tool(tool_description)]
 
-        agents[agent_spec["name"]] = create_agent(
-            _model,
-            system_prompt=agent_spec["system_prompt"],
-            tools=_tools,
-            middleware=_middleware,
-        )
+    def _compile_subagents(self) -> dict[str, Runnable]:
+        """Compile all subagents at initialization time."""
+        compiled = {}
 
-    return agents, descriptions
+        # Compile general-purpose subagent if enabled
+        if self._include_general_purpose:
+            compiled["general-purpose"] = create_agent(
+                self._default_model,
+                system_prompt=GENERAL_PURPOSE_SYSTEM_PROMPT,
+                tools=self._default_tools,
+                middleware=self._default_middleware,
+            )
 
+        # Compile custom subagents
+        for spec in self._specs:
+            if "runnable" in spec:
+                # Use pre-compiled runnable
+                compiled[spec["name"]] = spec["runnable"]
+            else:
+                # Compile from spec with defaults
+                compiled[spec["name"]] = create_agent(
+                    spec.get("model") or self._default_model,
+                    system_prompt=spec.get("system_prompt", GENERAL_PURPOSE_SYSTEM_PROMPT),
+                    tools=spec.get("tools") or self._default_tools,
+                    middleware=spec.get("middleware") or self._default_middleware,
+                )
 
-def _create_task_tool(
-    *,
-    default_model: str | BaseChatModel,
-    default_tools: Sequence[BaseTool | Callable | dict[str, Any]],
-    default_middleware: list[AgentMiddleware] | None,
-    subagents: list[SubAgentSpec | CompiledSubAgent],
-    include_general_purpose: bool,
-    custom_description: str | None = None,
-    stream_subagent_events: bool = False,
-    output_handlers: list["OutputHandler"] | None = None,
-) -> BaseTool:
-    """Create the task tool for invoking subagents.
+        return compiled
 
-    Args:
-        default_model: Default model for subagents.
-        default_tools: Default tools for subagents.
-        default_middleware: Middleware to apply to all subagents.
-        subagents: List of subagent specifications.
-        include_general_purpose: Whether to include general-purpose agent.
-        custom_description: Optional custom tool description.
-        stream_subagent_events: Whether to emit subagent_start/end events.
-        output_handlers: Output handlers to receive subagent events.
+    def _build_descriptions(self) -> list[str]:
+        """Build description list for task tool."""
+        descriptions = []
 
-    Returns:
-        A StructuredTool that can invoke subagents.
-    """
-    # Helper to emit events to all output handlers
-    def _emit_event(event_type: str, data: dict[str, Any]) -> None:
-        if not stream_subagent_events or not output_handlers:
+        if self._include_general_purpose:
+            descriptions.append(
+                "- general-purpose: General-purpose agent for research and multi-step tasks"
+            )
+
+        for spec in self._specs:
+            descriptions.append(f"- {spec['name']}: {spec['description']}")
+
+        return descriptions
+
+    def _emit_event(self, event_type: str, data: dict[str, Any]) -> None:
+        """Emit event to all output handlers."""
+        if not self._stream_subagent_events or not self._output_handlers:
             return
-        for handler in output_handlers:
+        for handler in self._output_handlers:
             try:
                 handler.emit(event_type, data)
             except Exception:
                 pass  # Silently ignore handler errors
-    agent_graphs, agent_descriptions = _build_subagents(
-        default_model=default_model,
-        default_tools=default_tools,
-        default_middleware=default_middleware,
-        subagents=subagents,
-        include_general_purpose=include_general_purpose,
-    )
-    description_str = "\n".join(agent_descriptions)
 
-    # Build tool description
-    if custom_description is None:
-        tool_description = TASK_TOOL_DESCRIPTION.format(
-            available_agents=description_str
-        )
-    elif "{available_agents}" in custom_description:
-        tool_description = custom_description.format(
-            available_agents=description_str
-        )
-    else:
-        tool_description = custom_description
+    def _create_task_tool(self, description: str) -> BaseTool:
+        """Create the task tool with compiled subagents."""
+        compiled = self._compiled_subagents
+        recursion_limit = self._subagent_recursion_limit
 
-    def _prepare_subagent_state(
-        subagent_type: str,
-        description: str,
-        runtime: ToolRuntime,
-    ) -> tuple[Runnable, dict]:
-        """Prepare state for subagent invocation."""
-        subagent = agent_graphs[subagent_type]
+        # Closures for helper methods
+        emit_event = self._emit_event
+        stream_events = self._stream_subagent_events
+        output_handlers = self._output_handlers
 
-        # Create new state excluding messages/todos
-        subagent_state = {
-            k: v
-            for k, v in runtime.state.items()
-            if k not in _EXCLUDED_STATE_KEYS
-        }
-        subagent_state["messages"] = [HumanMessage(content=description)]
+        def _prepare_subagent_state(
+            description: str,
+            runtime: ToolRuntime,
+        ) -> dict:
+            """Prepare state for subagent invocation."""
+            subagent_state = {
+                k: v
+                for k, v in runtime.state.items()
+                if k not in _EXCLUDED_STATE_KEYS
+            }
+            subagent_state["messages"] = [HumanMessage(content=description)]
+            return subagent_state
 
-        return subagent, subagent_state
+        def _create_command_from_result(
+            result: dict,
+            tool_call_id: str,
+        ) -> Command:
+            """Create Command with state update from subagent result."""
+            state_update = {
+                k: v for k, v in result.items() if k not in _EXCLUDED_STATE_KEYS
+            }
+            final_text = _get_final_message_text(result)
+            return Command(
+                update={
+                    **state_update,
+                    "messages": [
+                        ToolMessage(
+                            final_text or "Task completed.",
+                            tool_call_id=tool_call_id,
+                        )
+                    ],
+                }
+            )
 
-    def _stream_subagent_with_events(
-        subagent: Runnable,
-        state: dict,
-        subagent_name: str,
-    ) -> dict:
-        """Stream subagent execution and emit tool events."""
-        from langchain_core.messages import AIMessage as AIMsg
-        from langchain_core.messages import ToolMessage as ToolMsg
+        def _stream_subagent_with_events(
+            subagent: Runnable,
+            state: dict,
+            subagent_name: str,
+        ) -> dict:
+            """Stream subagent execution and emit tool events."""
+            from langchain_core.messages import AIMessage as AIMsg
+            from langchain_core.messages import ToolMessage as ToolMsg
 
-        final_state = None
-        for chunk in subagent.stream(state, stream_mode=["updates", "messages"]):
-            if isinstance(chunk, tuple):
-                mode, data = chunk
-                if mode == "updates" and isinstance(data, dict):
-                    for node_name, node_output in data.items():
-                        if isinstance(node_output, dict) and "messages" in node_output:
-                            messages = node_output["messages"]
-                            if not isinstance(messages, list):
-                                messages = [messages]
-                            for msg in messages:
-                                if isinstance(msg, AIMsg) and msg.tool_calls:
-                                    for tool_call in msg.tool_calls:
-                                        _emit_event("subagent_tool_call", {
-                                            "subagent_name": subagent_name,
-                                            "tool": tool_call.get("name"),
-                                            "args": tool_call.get("args", {}),
-                                            "id": tool_call.get("id"),
-                                        })
-                                elif isinstance(msg, ToolMsg):
-                                    _emit_event("subagent_tool_result", {
-                                        "subagent_name": subagent_name,
-                                        "tool": msg.name,
-                                        "result": msg.content[:500] if msg.content else "",
-                                        "tool_call_id": msg.tool_call_id,
-                                    })
-                        final_state = node_output
-        return final_state or {}
+            subagent_config = {"recursion_limit": recursion_limit}
+            accumulated_messages = []
+            other_state = {}
 
-    async def _astream_subagent_with_events(
-        subagent: Runnable,
-        state: dict,
-        subagent_name: str,
-        max_retries: int = 1,
-    ) -> dict:
-        """Async stream subagent execution with retry logic.
-
-        Args:
-            subagent: The subagent runnable to execute.
-            state: Input state for the subagent.
-            subagent_name: Name of the subagent for event emission.
-            max_retries: Maximum retry attempts (default 1 for subagents).
-
-        Returns:
-            Final state dict, or error message on failure.
-        """
-        from langchain_core.messages import AIMessage as AIMsg
-        from langchain_core.messages import ToolMessage as ToolMsg
-
-        from src.errors import classify_error
-
-        for attempt in range(max_retries + 1):
-            try:
-                final_state = None
-                chunk_count = 0
-
-                async for chunk in subagent.astream(
-                    state, stream_mode=["updates", "messages"]
-                ):
-                    chunk_count += 1
-                    if isinstance(chunk, tuple):
-                        mode, data = chunk
-                        if mode == "updates" and isinstance(data, dict):
-                            for node_name, node_output in data.items():
-                                if (
-                                    isinstance(node_output, dict)
-                                    and "messages" in node_output
-                                ):
+            for chunk in subagent.stream(
+                state, config=subagent_config, stream_mode=["updates", "messages"]
+            ):
+                if isinstance(chunk, tuple):
+                    mode, data = chunk
+                    if mode == "updates" and isinstance(data, dict):
+                        for node_name, node_output in data.items():
+                            if isinstance(node_output, dict):
+                                if "messages" in node_output:
                                     messages = node_output["messages"]
                                     if not isinstance(messages, list):
                                         messages = [messages]
+                                    accumulated_messages.extend(messages)
                                     for msg in messages:
                                         if isinstance(msg, AIMsg) and msg.tool_calls:
                                             for tool_call in msg.tool_calls:
-                                                _emit_event(
+                                                emit_event(
                                                     "subagent_tool_call",
                                                     {
                                                         "subagent_name": subagent_name,
@@ -348,7 +415,7 @@ def _create_task_tool(
                                                     },
                                                 )
                                         elif isinstance(msg, ToolMsg):
-                                            _emit_event(
+                                            emit_event(
                                                 "subagent_tool_result",
                                                 {
                                                     "subagent_name": subagent_name,
@@ -361,248 +428,236 @@ def _create_task_tool(
                                                     "tool_call_id": msg.tool_call_id,
                                                 },
                                             )
-                                final_state = node_output
+                                for k, v in node_output.items():
+                                    if k != "messages":
+                                        other_state[k] = v
 
-                # Handle empty stream
-                if chunk_count == 0:
-                    raise RuntimeError("No generations found in stream")
+            result = {**other_state}
+            if accumulated_messages:
+                result["messages"] = accumulated_messages
+            return result
 
-                return final_state or {}
+        async def _astream_subagent_with_events(
+            subagent: Runnable,
+            state: dict,
+            subagent_name: str,
+            max_retries: int = 1,
+        ) -> dict:
+            """Async stream subagent execution with retry logic."""
+            from langchain_core.messages import AIMessage as AIMsg
+            from langchain_core.messages import ToolMessage as ToolMsg
 
-            except Exception as e:
-                llm_error = classify_error(e)
+            from src.errors import classify_error
 
-                # Emit subagent error event
-                _emit_event(
-                    "subagent_error",
-                    {
-                        "subagent_name": subagent_name,
-                        "message": llm_error.message,
-                        "attempt": attempt + 1,
-                        "retryable": llm_error.retryable,
-                    },
-                )
+            subagent_config = {"recursion_limit": recursion_limit}
+            for attempt in range(max_retries + 1):
+                try:
+                    accumulated_messages = []
+                    other_state = {}
+                    chunk_count = 0
 
-                if not llm_error.retryable or attempt >= max_retries:
-                    # Return error message gracefully instead of crashing
-                    from langchain_core.messages import AIMessage
+                    async for chunk in subagent.astream(
+                        state,
+                        config=subagent_config,
+                        stream_mode=["updates", "messages"],
+                    ):
+                        chunk_count += 1
+                        if isinstance(chunk, tuple):
+                            mode, data = chunk
+                            if mode == "updates" and isinstance(data, dict):
+                                for node_name, node_output in data.items():
+                                    if isinstance(node_output, dict):
+                                        if "messages" in node_output:
+                                            messages = node_output["messages"]
+                                            if not isinstance(messages, list):
+                                                messages = [messages]
+                                            accumulated_messages.extend(messages)
+                                            for msg in messages:
+                                                if (
+                                                    isinstance(msg, AIMsg)
+                                                    and msg.tool_calls
+                                                ):
+                                                    for tool_call in msg.tool_calls:
+                                                        emit_event(
+                                                            "subagent_tool_call",
+                                                            {
+                                                                "subagent_name": subagent_name,
+                                                                "tool": tool_call.get(
+                                                                    "name"
+                                                                ),
+                                                                "args": tool_call.get(
+                                                                    "args", {}
+                                                                ),
+                                                                "id": tool_call.get(
+                                                                    "id"
+                                                                ),
+                                                            },
+                                                        )
+                                                elif isinstance(msg, ToolMsg):
+                                                    emit_event(
+                                                        "subagent_tool_result",
+                                                        {
+                                                            "subagent_name": subagent_name,
+                                                            "tool": msg.name,
+                                                            "result": (
+                                                                msg.content[:500]
+                                                                if msg.content
+                                                                else ""
+                                                            ),
+                                                            "tool_call_id": msg.tool_call_id,
+                                                        },
+                                                    )
+                                        for k, v in node_output.items():
+                                            if k != "messages":
+                                                other_state[k] = v
 
-                    return {
-                        "messages": [
-                            AIMessage(
-                                content=f"SubAgent '{subagent_name}' error: {llm_error.message}",
-                            )
-                        ]
-                    }
+                    if chunk_count == 0:
+                        raise RuntimeError("No generations found in stream")
 
-                await asyncio.sleep(1.0 * (attempt + 1))
+                    result = {**other_state}
+                    if accumulated_messages:
+                        result["messages"] = accumulated_messages
+                    return result
 
-        return {}
+                except Exception as e:
+                    llm_error = classify_error(e)
 
-    def _create_command_from_result(
-        result: dict,
-        tool_call_id: str,
-    ) -> Command:
-        """Create Command with state update from subagent result."""
-        state_update = {
-            k: v for k, v in result.items() if k not in _EXCLUDED_STATE_KEYS
-        }
-        return Command(
-            update={
-                **state_update,
-                "messages": [
-                    ToolMessage(
-                        result["messages"][-1].text,
-                        tool_call_id=tool_call_id,
+                    emit_event(
+                        "subagent_error",
+                        {
+                            "subagent_name": subagent_name,
+                            "message": llm_error.message,
+                            "attempt": attempt + 1,
+                            "retryable": llm_error.retryable,
+                        },
                     )
-                ],
-            }
+
+                    if not llm_error.retryable or attempt >= max_retries:
+                        from langchain_core.messages import AIMessage
+
+                        return {
+                            "messages": [
+                                AIMessage(
+                                    content=f"SubAgent '{subagent_name}' error: {llm_error.message}",
+                                )
+                            ]
+                        }
+
+                    await asyncio.sleep(1.0 * (attempt + 1))
+
+            return {}
+
+        def task(
+            description: str,
+            subagent_type: str,
+            runtime: ToolRuntime,
+        ) -> str | Command:
+            """Invoke a subagent synchronously."""
+            # Get compiled subagent
+            subagent = compiled.get(subagent_type)
+            if subagent is None:
+                available = list(compiled.keys())
+                return f"Unknown subagent type '{subagent_type}'. Available: {', '.join(available)}"
+
+            # Emit subagent_start event
+            emit_event(
+                "subagent_start",
+                {
+                    "name": subagent_type,
+                    "description": description,
+                },
+            )
+
+            state = _prepare_subagent_state(description, runtime)
+
+            # Execute subagent
+            subagent_config = {"recursion_limit": recursion_limit}
+            if stream_events and output_handlers:
+                result = _stream_subagent_with_events(subagent, state, subagent_type)
+            else:
+                result = subagent.invoke(state, config=subagent_config)
+
+            # Emit subagent_end event
+            final_message = _get_final_message_text(result)
+            emit_event(
+                "subagent_end",
+                {
+                    "name": subagent_type,
+                    "result": final_message,
+                },
+            )
+
+            if not runtime.tool_call_id:
+                raise ValueError("Tool call ID is required for subagent invocation")
+
+            return _create_command_from_result(result, runtime.tool_call_id)
+
+        async def atask(
+            description: str,
+            subagent_type: str,
+            runtime: ToolRuntime,
+        ) -> str | Command:
+            """Invoke a subagent asynchronously."""
+            # Get compiled subagent
+            subagent = compiled.get(subagent_type)
+            if subagent is None:
+                available = list(compiled.keys())
+                return f"Unknown subagent type '{subagent_type}'. Available: {', '.join(available)}"
+
+            # Emit subagent_start event
+            emit_event(
+                "subagent_start",
+                {
+                    "name": subagent_type,
+                    "description": description,
+                },
+            )
+
+            state = _prepare_subagent_state(description, runtime)
+
+            # Execute subagent
+            subagent_config = {"recursion_limit": recursion_limit}
+            if stream_events and output_handlers:
+                result = await _astream_subagent_with_events(
+                    subagent, state, subagent_type
+                )
+            else:
+                result = await subagent.ainvoke(state, config=subagent_config)
+
+            # Emit subagent_end event
+            final_message = _get_final_message_text(result)
+            emit_event(
+                "subagent_end",
+                {
+                    "name": subagent_type,
+                    "result": final_message,
+                },
+            )
+
+            if not runtime.tool_call_id:
+                raise ValueError("Tool call ID is required for subagent invocation")
+
+            return _create_command_from_result(result, runtime.tool_call_id)
+
+        return StructuredTool.from_function(
+            name="task",
+            func=task,
+            coroutine=atask,
+            description=description,
         )
-
-    def task(
-        description: str,
-        subagent_type: str,
-        runtime: ToolRuntime,
-    ) -> str | Command:
-        """Invoke a subagent synchronously."""
-        if subagent_type not in agent_graphs:
-            allowed = ", ".join([f"`{k}`" for k in agent_graphs])
-            return f"Unknown subagent type '{subagent_type}'. Available: {allowed}"
-
-        # Emit subagent_start event
-        _emit_event("subagent_start", {
-            "name": subagent_type,
-            "description": description,
-        })
-
-        subagent, state = _prepare_subagent_state(
-            subagent_type, description, runtime
-        )
-
-        # Use streaming to emit internal tool events
-        if stream_subagent_events and output_handlers:
-            result = _stream_subagent_with_events(subagent, state, subagent_type)
-        else:
-            result = subagent.invoke(state)
-
-        # Emit subagent_end event with full result for structured rendering
-        final_message = result["messages"][-1].text if result.get("messages") else ""
-        _emit_event("subagent_end", {
-            "name": subagent_type,
-            "result": final_message,  # Full result for frontend rendering
-        })
-
-        if not runtime.tool_call_id:
-            raise ValueError("Tool call ID is required for subagent invocation")
-
-        return _create_command_from_result(result, runtime.tool_call_id)
-
-    async def atask(
-        description: str,
-        subagent_type: str,
-        runtime: ToolRuntime,
-    ) -> str | Command:
-        """Invoke a subagent asynchronously."""
-        if subagent_type not in agent_graphs:
-            allowed = ", ".join([f"`{k}`" for k in agent_graphs])
-            return f"Unknown subagent type '{subagent_type}'. Available: {allowed}"
-
-        # Emit subagent_start event
-        _emit_event("subagent_start", {
-            "name": subagent_type,
-            "description": description,
-        })
-
-        subagent, state = _prepare_subagent_state(
-            subagent_type, description, runtime
-        )
-
-        # Use streaming to emit internal tool events
-        if stream_subagent_events and output_handlers:
-            result = await _astream_subagent_with_events(subagent, state, subagent_type)
-        else:
-            result = await subagent.ainvoke(state)
-
-        # Emit subagent_end event with full result for structured rendering
-        final_message = result["messages"][-1].text if result.get("messages") else ""
-        _emit_event("subagent_end", {
-            "name": subagent_type,
-            "result": final_message,  # Full result for frontend rendering
-        })
-
-        if not runtime.tool_call_id:
-            raise ValueError("Tool call ID is required for subagent invocation")
-
-        return _create_command_from_result(result, runtime.tool_call_id)
-
-    return StructuredTool.from_function(
-        name="task",
-        func=task,
-        coroutine=atask,
-        description=tool_description,
-    )
-
-
-class CustomSubAgentMiddleware(AgentMiddleware):
-    """Middleware that provides subagent capabilities via a `task` tool.
-
-    This middleware adds a task tool that can invoke specialized subagents.
-    Subagents are useful for:
-    - Complex multi-step tasks requiring isolated context
-    - Domain-specific tasks needing specialized tools
-    - Parallel task execution
-
-    Example:
-        ```python
-        from langchain.agents import create_agent
-        from src.middleware.subagent_middleware import (
-            CustomSubAgentMiddleware,
-            SubAgentSpec,
-        )
-
-        # Define a specialized subagent
-        search_agent: SubAgentSpec = {
-            "name": "web_search",
-            "description": "Search the web for current information",
-            "system_prompt": "You are a web research specialist.",
-            "tools": [search_tool],
-        }
-
-        # Create middleware
-        subagent_middleware = CustomSubAgentMiddleware(
-            default_model=model,
-            default_tools=[],
-            subagents=[search_agent],
-        )
-
-        # Use with create_agent
-        agent = create_agent(
-            model,
-            tools=[my_tool],
-            middleware=[subagent_middleware],
-        )
-        ```
-    """
-
-    def __init__(
-        self,
-        *,
-        default_model: str | BaseChatModel,
-        default_tools: Sequence[BaseTool | Callable | dict[str, Any]] | None = None,
-        default_middleware: list[AgentMiddleware] | None = None,
-        subagents: list[SubAgentSpec | CompiledSubAgent] | None = None,
-        system_prompt: str | None = TASK_SYSTEM_PROMPT,
-        include_general_purpose: bool = True,
-        task_description: str | None = None,
-        stream_subagent_events: bool = False,
-        output_handlers: list["OutputHandler"] | None = None,
-    ) -> None:
-        """Initialize the SubAgent Middleware.
-
-        Args:
-            default_model: Model to use for subagents (model instance or string).
-            default_tools: Default tools for the general-purpose subagent.
-            default_middleware: Middleware to apply to all subagents.
-            subagents: List of subagent specifications.
-            system_prompt: System prompt addition explaining task tool usage.
-                Set to None to disable prompt injection.
-            include_general_purpose: Whether to include a general-purpose subagent.
-            task_description: Custom description for the task tool.
-            stream_subagent_events: Whether to emit subagent_start/end events.
-                When True, requires output_handlers to be set.
-            output_handlers: Output handlers to receive subagent events.
-                Required when stream_subagent_events is True.
-        """
-        super().__init__()
-        self.system_prompt = system_prompt
-        self.stream_subagent_events = stream_subagent_events
-        self.output_handlers = output_handlers
-
-        # Create the task tool
-        task_tool = _create_task_tool(
-            default_model=default_model,
-            default_tools=default_tools or [],
-            default_middleware=default_middleware,
-            subagents=subagents or [],
-            include_general_purpose=include_general_purpose,
-            custom_description=task_description,
-            stream_subagent_events=stream_subagent_events,
-            output_handlers=output_handlers,
-        )
-        self.tools = [task_tool]
 
     def wrap_model_call(
         self,
         request: ModelRequest,
         handler: Callable[[ModelRequest], ModelResponse],
     ) -> ModelResponse:
-        """Inject system prompt with subagent instructions."""
-        if self.system_prompt is not None:
+        """Inject system prompt (no request storage needed)."""
+        if self._system_prompt is not None:
             current_prompt = request.system_prompt or ""
             new_prompt = (
-                f"{current_prompt}\n\n{self.system_prompt}"
+                f"{current_prompt}\n\n{self._system_prompt}"
                 if current_prompt
-                else self.system_prompt
+                else self._system_prompt
             )
             return handler(request.override(system_prompt=new_prompt))
         return handler(request)
@@ -612,13 +667,13 @@ class CustomSubAgentMiddleware(AgentMiddleware):
         request: ModelRequest,
         handler: Callable[[ModelRequest], Awaitable[ModelResponse]],
     ) -> ModelResponse:
-        """Inject system prompt with subagent instructions (async)."""
-        if self.system_prompt is not None:
+        """Inject system prompt (no request storage needed, async)."""
+        if self._system_prompt is not None:
             current_prompt = request.system_prompt or ""
             new_prompt = (
-                f"{current_prompt}\n\n{self.system_prompt}"
+                f"{current_prompt}\n\n{self._system_prompt}"
                 if current_prompt
-                else self.system_prompt
+                else self._system_prompt
             )
             return await handler(request.override(system_prompt=new_prompt))
         return await handler(request)

@@ -110,11 +110,10 @@ def create_primary_agent(
     todo_middleware = TodoMiddleware()
 
     # Build middleware stack
+    # CustomSubAgentMiddleware uses lazy resolution - subagents inherit tools from request
     middleware = [
         todo_middleware,
         CustomSubAgentMiddleware(
-            default_model=model,
-            default_tools=todo_middleware.tools,  # Pass todo tools to subagents
             subagents=[search_subagent, content_processor_subagent],
             include_general_purpose=True,
             stream_subagent_events=output_handlers is not None,

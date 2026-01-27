@@ -38,6 +38,8 @@ from deepagents.middleware.patch_tool_calls import PatchToolCallsMiddleware
 from deepagents.middleware.skills import SkillsMiddleware
 from deepagents.middleware.filesystem import FilesystemMiddleware
 from langchain_openai import AzureChatOpenAI
+from langchain_community.tools import DuckDuckGoSearchResults
+from langgraph.checkpoint.base import BaseCheckpointSaver
 
 from backends import DockerBackend
 from src.middleware import CustomSubAgentMiddleware
@@ -69,6 +71,7 @@ def create_skill_agent(
     skills_root: str | Path = "./skills",
     workspace_root: str | Path = "./workspace",
     output_handlers: list["OutputHandler"] | None = None,
+    checkpointer: BaseCheckpointSaver | None = None,
 ):
     """Create agent with manual middleware configuration.
 
@@ -82,6 +85,8 @@ def create_skill_agent(
         workspace_root: Path to the workspace directory for user files.
         output_handlers: Optional output handlers for streaming subagent events.
             When provided, enables visibility into subagent tool calls and lifecycle.
+        checkpointer: Optional checkpointer for multi-turn conversation persistence.
+            When provided, enables conversation history across invocations using thread_id.
 
     Returns:
         CompiledStateGraph (LangGraph compatible)
@@ -128,87 +133,62 @@ def create_skill_agent(
         },
     )
 
-    # Step 3: Build middleware stack manually (replicating create_deep_agent behavior)
-    middleware_stack = [
-        # Todo management
-        TodoListMiddleware(),
-        # Skills discovery and documentation
-        SkillsMiddleware(
-            backend=backend_factory,  # Reuse same backend as FilesystemMiddleware
-            sources=["/skills/"]  # Path will be routed to actual skills directory
-        ),
-        # File operations and command execution (sandboxed via DockerBackend)
-        FilesystemMiddleware(backend=backend_factory),
-        # Subagent delegation with event streaming
-        CustomSubAgentMiddleware(
-            default_model=model,
-            default_tools=[],  # general-purpose subagent inherits all tools
-            subagents=[],  # No custom subagents, only general-purpose
-            include_general_purpose=True,
-            stream_subagent_events=output_handlers is not None,
-            output_handlers=output_handlers,
-            # Default middleware for subagents (same as create_deep_agent)
-            default_middleware=[
-                TodoListMiddleware(),
-                SkillsMiddleware(
-                    backend=backend_factory,
-                    sources=["/skills/"]
-                ),
-                FilesystemMiddleware(backend=backend_factory),
-                SummarizationMiddleware(
-                    model=model,
-                    max_tokens_before_summary=170000,
-                    messages_to_keep=6,
-                ),
-                AnthropicPromptCachingMiddleware(unsupported_model_behavior="ignore"),
-                PatchToolCallsMiddleware(),
-            ],
-        ),
-        # Conversation summarization
+    # Step 3: Create web search tool
+    search_tool = DuckDuckGoSearchResults(max_results=5)
+
+    # Step 4: Build middleware stack
+    # Architecture: Tool-providing middleware auto-inject tools via create_agent()
+
+    # 4.1: Create tool-providing middleware (shared between main agent and subagent)
+    todo_middleware = TodoListMiddleware()
+    skills_middleware = SkillsMiddleware(
+        backend=backend_factory,
+        sources=["/skills/"]
+    )
+    filesystem_middleware = FilesystemMiddleware(backend=backend_factory)
+
+    # 4.2: Define subagent middleware stack
+    # Middleware auto-injects tools, no need to manually collect middleware.tools
+    subagent_middleware = [
+        todo_middleware,
+        skills_middleware,
+        filesystem_middleware,
         SummarizationMiddleware(
             model=model,
             max_tokens_before_summary=170000,
             messages_to_keep=6,
         ),
-        # Prompt caching for Claude models
         AnthropicPromptCachingMiddleware(unsupported_model_behavior="ignore"),
-        # Tool call patching for compatibility
         PatchToolCallsMiddleware(),
     ]
 
-    # Step 4: System prompt with file access and skill execution info
+    # 4.3: Assemble main agent middleware stack
+    middleware_stack = [
+        todo_middleware,
+        skills_middleware,
+        filesystem_middleware,
+        # Subagent delegation with event streaming
+        CustomSubAgentMiddleware(
+            default_model=model,
+            default_tools=[search_tool],  # Extra tools not from middleware
+            default_middleware=subagent_middleware,
+            subagents=[],
+            include_general_purpose=True,
+            stream_subagent_events=output_handlers is not None,
+            output_handlers=output_handlers,
+        ),
+        SummarizationMiddleware(
+            model=model,
+            max_tokens_before_summary=170000,
+            messages_to_keep=6,
+        ),
+        AnthropicPromptCachingMiddleware(unsupported_model_behavior="ignore"),
+        PatchToolCallsMiddleware(),
+    ]
+
+    # Step 5: System prompt with file access and skill execution info
     system_prompt = """You are a helpful assistant with access to skills and file operations.
 
-## Available Tools
-
-You have access to:
-- **File tools**: ls, read_file, write_file, edit_file, glob, grep
-- **Execute tool**: Run Python scripts and commands
-- **Task tool**: Delegate complex multi-step tasks to subagents (if enabled)
-
-## Skills
-
-Skills are automatically discovered and documented. Each skill provides specialized capabilities.
-
-### How to Use Skills
-
-1. **Read the skill documentation**: When you see a skill in <available_skills>, read its full documentation using read_file() to understand what it does and how to use it.
-
-2. **Follow skill instructions**: Skills may include:
-   - Python scripts in scripts/ directory
-   - Step-by-step usage instructions
-   - Example commands to execute
-
-3. **Execute skill scripts**: Many skills require script execution. Use the execute() tool to run them:
-   ```
-   execute(command="python3 /skills/skill-name/scripts/script_name.py <args>")
-   ```
-
-4. **Check skill requirements**: Some skills REQUIRE script execution because the AI cannot perform the operation directly:
-   - Cryptographic hash calculation (MD5, SHA256, SHA512)
-   - Binary file processing
-   - External API calls
-   - Complex data transformations
 
 ### When to Execute vs Delegate
 
@@ -223,20 +203,15 @@ Skills are automatically discovered and documented. Each skill provides speciali
   - No specific skill script is available
   - The task requires multiple tool calls and reasoning
 
-### Important Notes
-
-- **You CANNOT compute cryptographic hashes** - you must execute the hash script
-- **Read skill documentation first** - don't assume how skills work
-- **Follow the exact command format** provided in skill documentation
-- **Check file paths** - use /skills/ and /workspace/ prefixes as documented
 """
 
-    # Step 5: Create agent with manual middleware
+    # Step 6: Create agent with middleware stack
     agent = create_agent(
         model,
         system_prompt=system_prompt,
-        tools=[],  # Tools provided by middleware
+        tools=[search_tool],  # Web search tool + tools from middleware
         middleware=middleware_stack,
+        checkpointer=checkpointer,  # Enable multi-turn conversation persistence
     )
 
     return agent

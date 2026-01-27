@@ -10,9 +10,11 @@ This demonstrates:
 
 import os
 import sys
+import uuid
 from pathlib import Path
 
 from dotenv import load_dotenv
+from langgraph.checkpoint.memory import InMemorySaver
 
 # Add parent directory to path for src imports
 parent_dir = Path(__file__).parent.parent.parent
@@ -73,15 +75,24 @@ def main():
         console_output = ConsoleOutput(verbose=True, show_tokens=True)
         observer = AgentObserver(outputs=[console_output, trace_output])
 
+        # Create checkpointer for multi-turn conversation persistence
+        checkpointer = InMemorySaver()
+
         # Create agent with output handlers for subagent event streaming
         agent = create_skill_agent(
             skills_root=skills_path,
             workspace_root=workspace_path,
             output_handlers=observer.outputs,  # Enable subagent event visibility
+            checkpointer=checkpointer,  # Enable multi-turn conversation
         )
+
+        # Generate unique thread_id for this session
+        thread_id = str(uuid.uuid4())
+        config = {"configurable": {"thread_id": thread_id}}
 
         # Display session info
         print(f"Session UUID: {trace_output.session_uuid}")
+        print(f"Thread ID: {thread_id}")
         print(f"Traces will be saved to: {trace_output.trace_file}\n")
 
         # Chat loop
@@ -108,9 +119,11 @@ def main():
                 break
 
             # Run agent with observer for event tracing
+            # Pass config with thread_id for multi-turn conversation persistence
             result = observer.run(
                 agent,
-                {"messages": [{"role": "user", "content": user_input}]}
+                {"messages": [{"role": "user", "content": user_input}]},
+                config=config,
             )
 
             # Get last message with defensive check
