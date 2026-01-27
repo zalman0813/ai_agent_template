@@ -1,2 +1,7 @@
 # Agent temporary directory
 .agent_temp/
+
+# Generated outputs
+workspace/*.md
+workspace/*.pdf
+traces/
