@@ -102,6 +102,50 @@ Deep agents are characterized by four components:
 - **SKILL.md files**: Markdown-based skill definitions with YAML frontmatter
 - **Supported Platforms**: Claude Code, Claude.ai, GitHub, Cursor, VS Code, OpenAI Codex, Gemini CLI, Goose, Letta, OpenCode, Amp, Factory
 
+## Agent Strands SDK
+
+### Official Documentation
+- https://strandsagents.com/latest/documentation/docs/user-guide/concepts/agents/hooks/
+- https://strandsagents.com/latest/documentation/docs/api-reference/python/hooks/events/
+- https://strandsagents.com/latest/documentation/docs/user-guide/concepts/agents/session-management/
+- https://strandsagents.com/latest/documentation/docs/user-guide/observability-evaluation/traces/
+- https://docs.aws.amazon.com/bedrock-agentcore/latest/devguide/code-interpreter-using-strands.html
+
+### GitHub
+- https://github.com/strands-agents/sdk-python
+- https://github.com/strands-agents/tools
+- https://github.com/aws-samples/sample-strands-agent-with-agentcore
+
+### Local Docs
+- `strands-agents.md` - Core concepts: agent loop, hooks, state, tools, S3SessionManager, Code Interpreter
+- `strands-skill-design.md` - Skill system design spec: S3 namespace, SkillsHookProvider, workspace bridge
+- `strands-opentelemetry-with-aws.md` - OpenTelemetry with AWS X-Ray & CloudWatch: collector-less setup, per-user token cost tracking
+
+### Key Concepts
+- **Model-driven**: LLM orchestrates, not the developer (vs LangChain graph-driven)
+- **HookProvider**: `AgentInitializedEvent`, `BeforeInvocationEvent`, `AfterToolCallEvent`, etc.
+- **agent.state**: Persistent key-value store across turns; serialized by S3SessionManager
+- **invocation_state**: Per-request metadata passed via `agent(msg, invocation_state={...})`
+- **AgentCoreCodeInterpreter**: AWS sandboxed execution; session-cached per user/session
+- **S3SessionManager**: Persists conversation + agent.state to S3 across restarts
+- **OpenTelemetry**: `strands-agents[otel]` + ADOT SDK; collector-less to X-Ray/CloudWatch; auto-captures `gen_ai.usage.*` token metrics
+
+## Agent Strands Skill System Design
+
+### Design Principles
+- **Dynamic loading**: Skills defined as SKILL.md + scripts in S3, not pre-written Python tools
+- **Progressive disclosure**: metadata → full SKILL.md → script execution (3 stages)
+- **Workspace bridge**: `ci_pull_from_workspace` (S3→sandbox), `ci_push_to_workspace` (sandbox→S3)
+- **Caching**: Load metadata once in `AgentInitializedEvent`, cache in `agent.state` (equivalent to LangChain)
+
+### S3 Namespace
+- `skills/{name}/SKILL.md` — shared project-level (no user/session prefix)
+- `code-interpreter-workspace/{user_id}/{session_id}/` — per-session sandbox output
+- `documents/{user_id}/{session_id}/` — per-session user documents
+
+### Reference
+- `strands-skill-design.md` — complete design spec with flow charts and implementation
+
 ## LangChain Deep Agents SkillsMiddleware
 
 ### Official Documentation
